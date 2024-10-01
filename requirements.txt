@@ -1,0 +1,10 @@
+numpy
+torch
+transformers
+sentence-transformers
+pymongo
+openai>=1.0.0
+requests
+accelerate
+python-dotenv
+colorama
