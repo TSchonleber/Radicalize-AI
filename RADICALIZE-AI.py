@@ -1,110 +1,90 @@
 import os
+import asyncio
+import logging
+import random
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import aiohttp
+
 import threading
 import subprocess
+import time
+import re
+import json
+import networkx as nx
+import matplotlib.pyplot as plt
+from typing import List, Dict, Any
+
 import openai
-from openai import OpenAI
-from pymongo import MongoClient
 from dotenv import load_dotenv
-from pathlib import Path
 from colorama import init, Fore, Back, Style
 import requests
-import re
-import random
-import time
-import concurrent.futures
+import tiktoken
+import anthropic
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Pinecone
+from langchain_community.graphs import NetworkxEntityGraph
+from langchain_community.llms import OpenAI
+from langchain.text_splitter import CharacterTextSplitter
+from pinecone import Pinecone, ServerlessSpec
+from openai import OpenAI, AsyncOpenAI
+from openai import OpenAIError
+
+import numpy as np
+import hashlib
 
 # Initialize colorama
 init(autoreset=True)
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 # Load environment variables
 load_dotenv()
 
-# Debug: Print loaded environment variables
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY').strip()
-print(Fore.YELLOW + f"Full API Key for debugging: {OPENAI_API_KEY}")  # Remove this line in production
-print(Fore.YELLOW + f"OPENAI_API_KEY: {OPENAI_API_KEY[:5]}...{OPENAI_API_KEY[-5:]}")
-print(Fore.YELLOW + "MONGODB_URI:", os.getenv('MONGODB_URI'))
-print(Fore.YELLOW + "MONGODB_DB:", os.getenv('MONGODB_DB'))
-print(Fore.YELLOW + "MONGODB_COLLECTION:", os.getenv('MONGODB_COLLECTION'))
+# Load API Keys (Make sure to set these in your .env file)
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '').strip()
+CLAUDE_API_KEY = os.getenv('CLAUDE_API_KEY', '').strip()
+PINECONE_API_KEY = os.getenv('PINECONE_API_KEY', '').strip()
+PINECONE_INDEX_NAME = os.getenv('PINECONE_INDEX_NAME', '').strip()
+PINECONE_ENVIRONMENT = os.getenv('PINECONE_ENVIRONMENT', '').strip()
 
-# Initialize OpenAI client with explicit API key
-OPENAI_API_BASE = 'https://api.openai.com/v1'
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Validate API key format
-def validate_api_key(api_key):
-    if not api_key:
-        return False
-    # Check if the key starts with "sk-proj-" and is followed by a long string
-    return bool(re.match(r'^sk-proj-[a-zA-Z0-9-_]{50,}$', api_key))
-
-if not validate_api_key(OPENAI_API_KEY):
-    print(Fore.RED + f"Invalid API key format. Key: {OPENAI_API_KEY[:10]}...{OPENAI_API_KEY[-5:]}")
+if not OPENAI_API_KEY or not CLAUDE_API_KEY or not PINECONE_API_KEY or not PINECONE_INDEX_NAME or not PINECONE_ENVIRONMENT:
+    logging.error("API keys or Pinecone configuration not found. Please check your .env file.")
     exit(1)
 
-# Test OpenAI API connection
-def test_openai_connection():
-    try:
-        print(Fore.YELLOW + "Attempting to connect to OpenAI API...")
-        
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}"
-        }
-        
-        response = requests.get(f"{OPENAI_API_BASE}/models", headers=headers)
-        print(Fore.YELLOW + f"Response Status Code: {response.status_code}")
-        print(Fore.YELLOW + f"Response Content: {response.text[:200]}...")  # Print first 200 characters
-        
-        if response.status_code == 200:
-            print(Fore.GREEN + "Successfully connected to OpenAI API.")
-            return True
-        else:
-            print(Fore.RED + f"Failed to connect to OpenAI API. Status code: {response.status_code}")
-            print(Fore.RED + f"Error message: {response.text}")
-            return False
-    except requests.exceptions.RequestException as e:
-        print(Fore.RED + f"Network error: {str(e)}")
-    except Exception as e:
-        print(Fore.RED + f"Unexpected error: {str(e)}")
-    return False
+# Initialize API clients
+openai.api_key = OPENAI_API_KEY
+claude_client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
 
-# Run connection test
-if not test_openai_connection():
-    print(Fore.RED + "OpenAI API connection failed. Please check your setup and try again.")
-    exit(1)
-
-# Initialize MongoDB client with error handling
-MONGODB_URI = os.getenv('MONGODB_URI')
-if not MONGODB_URI:
-    raise ValueError("Environment variable 'MONGODB_URI' is not set.")
-
+# Initialize Pinecone
 try:
-    client_mongodb = MongoClient(MONGODB_URI)
-    # The following line will attempt to list databases to verify connection
-    client_mongodb.list_database_names()
-    print(Fore.GREEN + "MongoDB connection successful.")
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    
+    # List available indexes
+    index_list = pc.list_indexes()
+    
+    if PINECONE_INDEX_NAME not in index_list.names():
+        logging.warning(f"Index {PINECONE_INDEX_NAME} not found. Available indexes: {index_list.names()}")
+        
+        # Create the index if it doesn't exist
+        pc.create_index(
+            name=PINECONE_INDEX_NAME,
+            dimension=1536,  # OpenAI's embedding dimension
+            metric="cosine",
+            spec=ServerlessSpec(
+                cloud="azure",
+                region=PINECONE_ENVIRONMENT
+            )
+        )
+        logging.info(f"Created new index: {PINECONE_INDEX_NAME}")
+    
+    index = pc.Index(PINECONE_INDEX_NAME)
+    logging.info(f"Successfully connected to Pinecone index: {PINECONE_INDEX_NAME}")
 except Exception as e:
-    print(Fore.RED + f"Failed to connect to MongoDB: {e}")
-    # Instead of raising an error, we'll print it and continue without MongoDB
-    client_mongodb = None
+    logging.error(f"Error with Pinecone: {e}")
+    exit(1)
 
-# Add checks for environment variables
-MONGODB_DB = os.getenv('MONGODB_DB')
-if not MONGODB_DB:
-    print(Fore.YELLOW + "Warning: Environment variable 'MONGODB_DB' is not set.")
-
-MONGODB_COLLECTION = os.getenv('MONGODB_COLLECTION')
-if not MONGODB_COLLECTION:
-    print(Fore.YELLOW + "Warning: Environment variable 'MONGODB_COLLECTION' is not set.")
-
-if client_mongodb and MONGODB_DB and MONGODB_COLLECTION:
-    db = client_mongodb[MONGODB_DB]
-    collection = db[MONGODB_COLLECTION]
-else:
-    print(Fore.YELLOW + "MongoDB functionality will be disabled.")
-    collection = None
-
-# Initialize Llama model (using Ollama directly)
+# Initialize Llama model
 def initialize_llama_model():
     def llama_generate(prompt):
         try:
@@ -116,439 +96,567 @@ def initialize_llama_model():
             )
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
-            if "command not found" in str(e):
-                print(Fore.RED + "Ollama is not installed or not in your system PATH.")
-                print(Fore.YELLOW + "Please install Ollama from https://ollama.ai/download")
-                print(Fore.YELLOW + "After installation, make sure it's in your system PATH.")
-                return "Error: Ollama is not available. Please install it and try again."
-            elif "no such model" in str(e):
-                print(Fore.RED + "The specified Llama model is not available.")
-                print(Fore.YELLOW + "Please pull the model using: ollama pull llama3.1:8b")
-                return "Error: Llama model not available. Please pull the model and try again."
+            logging.error(f"Error from Llama model: {e}")
             return f"Error from Llama model: {str(e)}"
     return llama_generate
 
 llama_model = initialize_llama_model()
 
-# Define colors for each agent
-AGENT_COLORS = {
-    'Jane Austen (INFJ)': Fore.MAGENTA,
-    'George Orwell (INTJ)': Fore.CYAN,
-    'Virginia Woolf (INFP)': Fore.YELLOW,
-    'Ernest Hemingway (ESTP)': Fore.GREEN,
-    'Agatha Christie (ISTJ)': Fore.RED,
-    'Oscar Wilde (ENFP)': Fore.BLUE,
-    'Sylvia Plath (INFJ)': Fore.LIGHTMAGENTA_EX,
-    'Stephen King (INFP)': Fore.LIGHTRED_EX,
-    'Ada Lovelace (INTP)': Fore.LIGHTCYAN_EX,  # New color for Ada Lovelace
-    'Alan Turing (ENTJ)': Fore.LIGHTGREEN_EX  # New color for Alan Turing
-}
+# Constants
+MAX_TOTAL_TOKENS = 4096
+RETRY_LIMIT = 3
+RETRY_BACKOFF_FACTOR = 2
+MAX_REFINEMENT_ATTEMPTS = 3
 
-# Function to print styled text
-def print_styled(text, color=Fore.WHITE, style=Style.NORMAL, end='\n'):
-    print(f"{style}{color}{text}{Style.RESET_ALL}", end=end)
+# Load agents configuration from agents.json
+def load_agents_config():
+    try:
+        with open('agents.json', 'r', encoding='utf-8') as f:
+            agents_data = json.load(f)
+        logging.info("Agents configuration loaded successfully.")
+        return agents_data.get('agents', [])
+    except Exception as e:
+        logging.error(f"Error loading agents configuration: {e}")
+        exit(1)
 
-# Function to print a separator line
-def print_separator(char='-', length=50):
-    print_styled(char * length, Fore.WHITE, Style.DIM)
+agents_config = load_agents_config()
 
-# Function to run an OpenAI agent with added randomness and error handling
-def run_agent(agent_name, model_name, prompt, responses, scores):
-    start_time = time.time()
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            print_styled(f"Attempting to use model: {model_name}", Fore.YELLOW, Style.DIM)
-            messages = []
-            if model_name not in ['o1-mini', 'o1-preview', 'text-embedding-3-small', 'text-embedding-3-large']:
-                messages.append({"role": "system", "content": f"You are {agent_name}, a helpful assistant with a unique perspective. Provide diverse and creative responses. You can include code blocks using triple backticks."})
-            
-            messages.append({"role": "user", "content": prompt})
-            
-            if model_name in ['text-embedding-3-small', 'text-embedding-3-large']:
-                # For embedding models, we'll use them to generate embeddings and then use GPT to generate a response
-                response = client.embeddings.create(
-                    model=model_name,
-                    input=prompt
-                )
-                embedding = response.data[0].embedding
-                # Use the embedding to generate a response using GPT
-                gpt_response = client.chat.completions.create(
-                    model='gpt-4o',
-                    messages=[
-                        {"role": "system", "content": f"You are {agent_name}. Use the following embedding to generate a response: {embedding[:50]}..."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=1500  # Increased max tokens for embedding models
-                )
-                agent_response = gpt_response.choices[0].message.content
-            elif model_name in ['o1-mini', 'o1-preview']:
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    max_completion_tokens=2500 if model_name == 'o1-preview' else 2000  # Increased max_completion_tokens for o1 models
-                )
-                agent_response = response.choices[0].message.content
-            else:
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=random.uniform(0.5, 1.0),
-                    max_tokens=2000  # Increased max tokens for other GPT models
-                )
-                agent_response = response.choices[0].message.content
-            
-            response_time = time.time() - start_time
-            
-            # Calculate score
-            model_capability_factor = 1.5 if model_name in ['o1-preview', 'text-embedding-3-large'] else 1.2 if model_name in ['o1-mini', 'text-embedding-3-small'] else 1.1 if 'gpt-4o' in model_name else 1.0
-            time_factor = min(1.0, 60 / response_time)  # Normalize time factor
-            score = (len(agent_response.split()) * model_capability_factor * time_factor)
-            
-            responses[agent_name] = agent_response
-            scores[agent_name] = score
-            return agent_response
-        except Exception as e:
-            print_styled(f"Error from {agent_name} (Attempt {attempt+1}/{max_retries}): {str(e)}", Fore.RED, Style.BRIGHT)
-            if attempt == max_retries - 1:
-                error_message = f"Error from {agent_name} after {max_retries} attempts: {str(e)}"
-                responses[agent_name] = error_message
-                scores[agent_name] = 0
-                return error_message
-            time.sleep(2)  # Wait for 2 seconds before retrying
+# Agent colors
+AGENT_COLORS = [
+    Fore.MAGENTA, Fore.CYAN, Fore.YELLOW, Fore.GREEN, Fore.RED,
+    Fore.BLUE, Fore.LIGHTMAGENTA_EX, Fore.LIGHTRED_EX, Fore.LIGHTCYAN_EX,
+    Fore.LIGHTGREEN_EX, Fore.LIGHTYELLOW_EX
+]
 
-# Function to run legion mode with simultaneous agent responses
-def legion_mode(prompt):
-    agents = {
-        'Jane Austen (INFJ)': {'model': 'gpt-4o', 'currency': 'Regency Era Pounds'},
-        'George Orwell (INTJ)': {'model': 'gpt-4o', 'currency': 'Dystopian Credits'},
-        'Virginia Woolf (INFP)': {'model': 'gpt-4o', 'currency': 'Stream of Consciousness Tokens'},
-        'Ernest Hemingway (ESTP)': {'model': 'gpt-4o-mini', 'currency': 'Bullfighting Pesetas'},
-        'Agatha Christie (ISTJ)': {'model': 'gpt-4o-mini', 'currency': 'Mystery Solving Guineas'},
-        'Oscar Wilde (ENFP)': {'model': 'o1-mini', 'currency': 'Witty Epigram Coins'},
-        'Sylvia Plath (INFJ)': {'model': 'o1-mini', 'currency': 'Poetic Introspection Points'},
-        'Stephen King (INFP)': {'model': 'o1-preview', 'currency': 'Nightmare Fuel Dollars'},
-        'Ada Lovelace (INTP)': {'model': 'o1-mini', 'currency': 'Analytical Engine Tokens'},  # New agent
-        'Alan Turing (ENTJ)': {'model': 'gpt-4o', 'currency': 'Cryptographic Keys'},  # New agent
+class Agent:
+    ACTION_DESCRIPTIONS = {
+        'discuss': "formulating a response",
+        'verify': "verifying data",
+        'refine': "refining the response",
+        'critique': "critiquing another agent's response",
+        'reason': "applying advanced reasoning",
+        'collaborate': "collaborating with other agents",
+        'debate': "engaging in a debate",
+        'synthesize': "synthesizing information",
     }
+
+    def __init__(self, agent_config, color):
+        self.name = agent_config.get('name', 'Unnamed Agent')
+        self.color = color
+        self.specialty = agent_config.get('personality', {}).get('personality_traits', [])
+        self.system_purpose = agent_config.get('system_purpose', '')
+        self.custom_instructions = self._build_system_message(agent_config)
+        self.messages = []
+        self.score = 0
+        self.embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
+        self.memory = index  # Use the connected Pinecone index
+        self.namespace = f"agent_{self.name.lower().replace(' ', '_')}"
+        self.graph = NetworkxEntityGraph()
+        self.initialize_model(agent_config)
+
+    def initialize_model(self, agent_config):
+        # Assign specific models based on agent name or other attributes
+        model_assignments = {
+            'Jane Austen': 'gpt-4o',
+            'George Orwell': 'gpt-4o',
+            'Virginia Woolf': 'gpt-4o',
+            'Ernest Hemingway': 'gpt-4o-mini',
+            'Agatha Christie': 'gpt-4o-mini',
+            'Oscar Wilde': 'o1-mini',
+            'Sylvia Plath': 'o1-mini',
+            'Stephen King': 'o1-preview',
+            'Ada Lovelace': 'o1-mini',
+            'Alan Turing': 'gpt-4o',
+            'Riot the Husky': 'claude-3-5-sonnet-20240620',
+            'Zen Master': 'claude-3-5-sonnet-20240620',
+            'Maestro': 'claude-3-5-sonnet-20240620',
+            # Add other agents as needed
+        }
+        self.model_name = model_assignments.get(self.name, 'gpt-4o')
+
+    def _build_system_message(self, agent_config):
+        personality_description = f"Your name is {self.name}. {self.system_purpose}"
+
+        # Include interaction style
+        interaction_style = agent_config.get('interaction_style', {})
+        if interaction_style:
+            interaction_details = "\n".join(f"{k.replace('_', ' ').title()}: {v}" for k, v in interaction_style.items())
+            personality_description += f"\n\nInteraction Style:\n{interaction_details}"
+
+        # Include personality traits
+        personality_traits = agent_config.get('personality', {})
+        if personality_traits:
+            personality_details = "\n".join(f"{k.replace('_', ' ').title()}: {v}" for k, v in personality_traits.items())
+            personality_description += f"\n\nPersonality Traits:\n{personality_details}"
+
+        # Include other aspects if needed...
+
+        return personality_description
+
+    async def _add_message(self, role, content):
+        self.messages.append({"role": role, "content": content})
+        self._truncate_messages()
+        await self._update_memory(content)
+        self._update_graph(content)
+
+    def _truncate_messages(self):
+        encoding = tiktoken.get_encoding("cl100k_base")
+        while sum(len(encoding.encode(msg['content'])) for msg in self.messages) > MAX_TOTAL_TOKENS:
+            self.messages.pop(0)
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
+           retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError, OpenAIError)))
+    async def _generate_embedding(self, text):
+        try:
+            return await self.embedding_function.aembed_query(text)
+        except Exception as e:
+            logging.debug(f"Error generating embedding: {str(e)}. Using fallback method.")
+            return self._fallback_embedding(text)
+
+    def _fallback_embedding(self, text):
+        # Simple hash-based embedding (not as good as real embeddings, but works offline)
+        hash_object = hashlib.md5(text.encode())
+        hash_value = int(hash_object.hexdigest(), 16)
+        np.random.seed(hash_value % (2**32 - 1))
+        return np.random.rand(1536).tolist()  # OpenAI embeddings are 1536-dimensional
+
+    async def _update_memory(self, content):
+        try:
+            text_splitter = CharacterTextSplitter(
+                chunk_size=4000,  # Increased from 2000
+                chunk_overlap=200,
+                length_function=len,
+                is_separator_regex=False,
+            )
+            texts = text_splitter.split_text(content)
+            for i, text in enumerate(texts):
+                try:
+                    vector = await self._generate_embedding(text)
+                    self.memory.upsert(
+                        vectors=[(f"{self.name}-{i}", vector, {"text": text})],
+                        namespace=self.namespace
+                    )
+                    # Also update the hive mind
+                    self.memory.upsert(
+                        vectors=[(f"hive-{self.name}-{i}", vector, {"text": text, "agent": self.name})],
+                        namespace="hive_mind"
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to update memory for chunk {i} of {self.name}: {str(e)}")
+                await asyncio.sleep(0.1)  # Add a small delay between requests
+        except Exception as e:
+            logging.error(f"Failed to process content for {self.name}: {str(e)}")
+
+    def _update_graph(self, content):
+        # Remove or comment out any code using GraphQAChain
+        # If you need graph-based QA functionality, you may need to implement it differently
+        # or use an alternative approach
+        pass
+
+    async def exponential_backoff(self, attempt):
+        delay = min(2 ** attempt + random.uniform(0, 1), 60)
+        await asyncio.sleep(delay)
+
+    async def _handle_chat_response(self, prompt):
+        try:
+            await self._add_message("user", prompt)
+            messages = [{"role": "system", "content": self.custom_instructions}] + self.messages
+
+            max_retries = 5
+            base_delay = 1
+
+            for attempt in range(max_retries):
+                try:
+                    if self.model_name.startswith('claude'):
+                        response = await self._claude_chat(prompt)
+                    elif self.model_name.startswith('gpt-') or self.model_name.startswith('o1-'):
+                        response = await self._openai_chat(messages)
+                    else:
+                        response = await self._ollama_chat(prompt)
+                    reply = response.strip()
+                    await self._add_message("assistant", reply)
+                    return reply
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logging.error(f"Error in agent '{self.name}': {type(e).__name__}: {e}")
+                        return f"An error occurred while generating a response: {str(e)}"
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    logging.info(f"Retrying in {delay:.2f} seconds...")
+                    await asyncio.sleep(delay)
+
+            return "Failed to generate a response after multiple attempts."
+        except Exception as e:
+            logging.error(f"Unexpected error in _handle_chat_response for {self.name}: {str(e)}")
+            return f"An unexpected error occurred: {str(e)}"
+
+    async def _openai_chat(self, messages):
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        try:
+            # Remove 'system' message for models that don't support it
+            if self.model_name in ['o1-mini', 'o1-preview']:
+                messages = [msg for msg in messages if msg['role'] != 'system']
+                if not messages:
+                    # If messages is empty after removing 'system', add a default user message
+                    messages.append({"role": "user", "content": "Hello"})
+                elif messages[0]['role'] == 'user':
+                    messages[0]['content'] = f"{self.custom_instructions}\n\n{messages[0]['content']}"
+            
+            if not messages:
+                # If messages is still empty, add a default user message
+                messages.append({"role": "user", "content": "Hello"})
+            
+            response = await client.chat.completions.create(
+                model=self.model_name,
+                messages=messages
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.error(f"Error in OpenAI chat for agent '{self.name}': {e}")
+            raise e
+
+    async def _claude_chat(self, prompt):
+        try:
+            response = await claude_client.messages.create(
+                model=self.model_name,
+                max_tokens=1000,
+                system=self.custom_instructions,  # Use 'system' parameter instead of including it in messages
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return response.content[0].text
+        except Exception as e:
+            logging.error(f"Error in Claude model for agent '{self.name}': {e}")
+            raise e
+
+    async def _ollama_chat(self, prompt):
+        # For agents using Llama model via Ollama
+        try:
+            result = subprocess.run(
+                ['ollama', 'run', 'llama3.1:8b', prompt],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Error from Ollama model for agent '{self.name}': {e}")
+            return f"Error from Ollama model: {str(e)}"
+
+    async def discuss(self, prompt):
+        return await self._handle_chat_response(f"{self.name}, {self.system_purpose}\n\nUser Prompt: {prompt}")
+
+    async def verify(self, data):
+        return await self._handle_chat_response(f"Please verify the following response for accuracy and completeness:\n\n{data}")
+
+    async def refine(self, data, more_time=False):
+        refinement_prompt = f"Please refine the following response:\n\n{data}"
+        if more_time:
+            refinement_prompt += "\nTake additional time to thoroughly improve the response."
+        return await self._handle_chat_response(refinement_prompt)
+
+    async def critique(self, data):
+        return await self._handle_chat_response(f"Please critique the following response for accuracy and completeness:\n\n{data}")
+
+    async def reason(self, prompt, context):
+        reasoning_prompt = f"As {self.name}, apply advanced reasoning to address the following prompt:\n\nContext: {context}\n\nPrompt: {prompt}\n\nYour response should demonstrate critical thinking, logical consistency, and depth of analysis."
+        return await self._handle_chat_response(reasoning_prompt)
+
+    async def collaborate(self, other_agent, prompt):
+        collaboration_prompt = f"As {self.name}, collaborate with {other_agent.name} to address the following prompt:\n\nPrompt: {prompt}\n\nCombine your unique perspectives and expertise to provide a comprehensive response."
+        return await self._handle_chat_response(collaboration_prompt)
+
+    async def debate(self, other_agent, topic):
+        debate_prompt = f"As {self.name}, engage in a debate with {other_agent.name} on the following topic:\n\nTopic: {topic}\n\nPresent your arguments, counter-arguments, and reach a conclusion based on the debate."
+        return await self._handle_chat_response(debate_prompt)
+
+    async def synthesize(self, information):
+        synthesis_prompt = f"As {self.name}, synthesize the following information into a coherent and insightful summary:\n\nInformation: {information}\n\nIdentify key themes, draw connections, and provide a comprehensive overview."
+        return await self._handle_chat_response(synthesis_prompt)
+
+def print_styled(text, color=Fore.WHITE, style=Style.NORMAL):
+    print(f"{style}{color}{text}{Style.RESET_ALL}")
+
+def print_divider(char="═", length=80, color=Fore.YELLOW):
+    print(color + char * length + Style.RESET_ALL)
+
+async def blend_responses(responses, prompt):
+    blending_prompt = f"Combine these responses into a single, coherent answer to '{prompt}':\n\n" + "\n\n".join(responses)
+    try:
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-4",
+            messages=[{"role": "user", "content": blending_prompt}]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"Error in blending responses: {e}")
+        return "An error occurred while blending responses."
+
+def calculate_score(response, duration, complexity):
+    word_count = len(response.split())
+    return (word_count * complexity) * (1 / max(duration, 0.1)) * 10
+
+async def process_agent_action(agent, action, *args):
+    try:
+        result = await getattr(agent, action)(*args)
+        return result
+    except Exception as e:
+        logging.error(f"Error in {action} for {agent.name}: {str(e)}")
+        return f"Error: {str(e)}"
+
+async def legion_mode(prompt):
+    agents = [Agent(agent_config, AGENT_COLORS[i % len(AGENT_COLORS)]) for i, agent_config in enumerate(agents_config)]
+
+    print_styled("Legion Mode Activated", Fore.GREEN, Style.BRIGHT)
+    print_divider()
+    print_styled(f"Original Prompt: {prompt}", Fore.WHITE, Style.BRIGHT)
+    print_divider()
+
     responses = {}
     scores = {}
     conversation = []
 
-    print_styled("Legion Mode Activated", Fore.GREEN, Style.BRIGHT)
-    print_separator('=')
-    print_styled(f"Original Prompt: {prompt}", Fore.WHITE, Style.BRIGHT)
-    print_separator()
+    try:
+        # Step 1: Initial Responses
+        print_styled("Step 1: Generating Initial Responses", Fore.YELLOW, Style.BRIGHT)
+        tasks = [process_agent_action(agent, 'discuss', prompt) for agent in agents]
+        initial_responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Initial thoughts
-    initial_prompts = [
-        f"As {agent_name}, provide a brief initial thought on the following prompt: '{prompt}'. Be true to your writing style and personality. Keep it under 200 words."
-        for agent_name in agents.keys()
-    ]
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents)) as executor:
-        future_to_agent = {executor.submit(run_agent, agent_name, agent_info['model'], prompt, {}, {}): agent_name for agent_name, agent_info in agents.items()}
-        for future in concurrent.futures.as_completed(future_to_agent):
-            agent_name = future_to_agent[future]
-            response = future.result()
-            conversation.append(f"{agent_name}: {response}")
-            print_styled(f"{agent_name} says:", AGENT_COLORS.get(agent_name, Fore.WHITE), Style.BRIGHT)
-            print_styled(response, AGENT_COLORS.get(agent_name, Fore.WHITE))
-            print_separator('-')
+        for agent, response in zip(agents, initial_responses):
+            if isinstance(response, Exception):
+                print_styled(f"Error for {agent.name}: {str(response)}", agent.color)
+                responses[agent.name] = f"Error: {str(response)}"
+                scores[agent.name] = 0
+            else:
+                responses[agent.name] = response
+                scores[agent.name] = calculate_score(response, 1, 1)
+                print_styled(f"{agent.name}: {responses[agent.name]}", agent.color)
+                conversation.append(f"{agent.name}: {responses[agent.name]}")
 
-    # Add Llama model's initial thought
-    llama_response = llama_model(prompt)
-    conversation.append(f"Llama Model: {llama_response}")
-    print_styled("Llama Model says:", AGENT_COLORS.get('Llama Model', Fore.WHITE), Style.BRIGHT)
-    print_styled(llama_response, AGENT_COLORS.get('Llama Model', Fore.WHITE))
-    print_separator('-')
+        # Step 2: Verification and Fact-Checking
+        print_styled("\nStep 2: Verifying and Fact-Checking Responses", Fore.YELLOW, Style.BRIGHT)
+        verification_tasks = [process_agent_action(agent, 'verify', responses[agent.name]) for agent in agents]
+        verification_responses = await asyncio.gather(*verification_tasks)
 
-    # Interactive discussion
-    for _ in range(15):  # More iterations for a longer, more natural conversation
-        speaking_agent = random.choice(list(agents.keys()) + ['Llama Model'])
-        listening_agent = random.choice([a for a in list(agents.keys()) + ['Llama Model'] if a != speaking_agent])
+        for agent, response in zip(agents, verification_responses):
+            if not response.startswith("Error:"):
+                scores[agent.name] += calculate_score(response, 1, 1.2)
+                print_styled(f"{agent.name} verification: {response}", agent.color)
+                conversation.append(f"{agent.name} verification: {response}")
+
+        # Step 3: Critique and Debate
+        print_styled("\nStep 3: Critiquing and Debating Responses", Fore.YELLOW, Style.BRIGHT)
+        critique_tasks = []
+        for i, agent in enumerate(agents):
+            other_agent = agents[(i + 1) % len(agents)]
+            critique_tasks.append(process_agent_action(agent, 'critique', responses[other_agent.name]))
+        critique_responses = await asyncio.gather(*critique_tasks)
+
+        for agent, response in zip(agents, critique_responses):
+            if not response.startswith("Error:"):
+                scores[agent.name] += calculate_score(response, 1, 1.5)
+                print_styled(f"{agent.name} critique: {response}", agent.color)
+                conversation.append(f"{agent.name} critique: {response}")
+
+        # Step 4: Collaborative Reasoning
+        print_styled("\nStep 4: Collaborative Reasoning", Fore.YELLOW, Style.BRIGHT)
+        collaboration_tasks = []
+        for i in range(0, len(agents), 2):
+            agent1 = agents[i]
+            agent2 = agents[(i + 1) % len(agents)]
+            collaboration_tasks.append(process_agent_action(agent1, 'collaborate', agent2, prompt))
+        collaboration_responses = await asyncio.gather(*collaboration_tasks)
+
+        for idx in range(len(collaboration_responses)):
+            agent1 = agents[2*idx % len(agents)]
+            agent2 = agents[(2*idx + 1) % len(agents)]
+            response = collaboration_responses[idx]
+            if not response.startswith("Error:"):
+                scores[agent1.name] += calculate_score(response, 1, 1.8)
+                scores[agent2.name] += calculate_score(response, 1, 1.8)
+                print_styled(f"{agent1.name} and {agent2.name} collaboration: {response}", Fore.WHITE)
+                conversation.append(f"{agent1.name} and {agent2.name} collaboration: {response}")
+
+        # Step 5: Advanced Reasoning and Synthesis
+        print_styled("\nStep 5: Advanced Reasoning and Synthesis", Fore.YELLOW, Style.BRIGHT)
+        context = "\n".join(conversation)
+        reasoning_tasks = [process_agent_action(agent, 'reason', prompt, context) for agent in agents]
+        reasoning_responses = await asyncio.gather(*reasoning_tasks)
+
+        for agent, response in zip(agents, reasoning_responses):
+            if not response.startswith("Error:"):
+                responses[agent.name] = response
+                scores[agent.name] += calculate_score(response, 1, 2.0)
+                print_styled(f"{agent.name} reasoning: {responses[agent.name]}", agent.color)
+                conversation.append(f"{agent.name} reasoning: {responses[agent.name]}")
+
+        # Step 6: Final Refinement
+        print_styled("\nStep 6: Final Refinement", Fore.YELLOW, Style.BRIGHT)
+        refinement_tasks = [process_agent_action(agent, 'refine', responses[agent.name], True) for agent in agents]
+        refinement_responses = await asyncio.gather(*refinement_tasks)
+
+        for agent, response in zip(agents, refinement_responses):
+            if not response.startswith("Error:"):
+                responses[agent.name] = response
+                scores[agent.name] += calculate_score(response, 1, 1.5)
+                print_styled(f"{agent.name} refinement: {responses[agent.name]}", agent.color)
+                conversation.append(f"{agent.name} refinement: {responses[agent.name]}")
+
+        # Step 7: Information Synthesis
+        print_styled("\nStep 7: Information Synthesis", Fore.YELLOW, Style.BRIGHT)
+        all_responses = list(responses.values())
+        synthesis_tasks = [process_agent_action(agent, 'synthesize', "\n".join(all_responses)) for agent in agents]
+        synthesis_responses = await asyncio.gather(*synthesis_tasks)
+        synthesis_result = ""
+        for agent, response in zip(agents, synthesis_responses):
+            if not response.startswith("Error:"):
+                synthesis_result = response
+                print_styled(f"{agent.name} synthesized the information.", agent.color)
+                break
+        if not synthesis_result:
+            synthesis_result = "No synthesis was successful."
+        print_styled("Synthesized Information:", Fore.GREEN, Style.BRIGHT)
+        print_styled(synthesis_result, Fore.GREEN)
+        conversation.append(f"Synthesized Information: {synthesis_result}")
+
+        # Step 8: Final Blending and Enhancement
+        print_styled("\nStep 8: Final Blending and Enhancement", Fore.YELLOW, Style.BRIGHT)
+
+        agents_responses = ''.join([f"{agent.name}: {responses[agent.name]}\n" for agent in agents])
+
+        enhanced_prompt = (
+            f"Original prompt: {prompt}\n\n"
+            f"Agents' responses and synthesis:\n{agents_responses}\n\n"
+            "Provide an enhanced final response that incorporates the best elements of "
+            "all previous responses while maintaining coherence and addressing the original prompt comprehensively."
+        )
+        final_response = llama_model(enhanced_prompt)
+        print_styled("Final Enhanced Response:", Fore.GREEN, Style.BRIGHT)
+        print_styled(final_response, Fore.GREEN)
+
+        # Determine winner and runner-ups
+        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        winner = sorted_scores[0][0]
+        runner_ups = [agent for agent, _ in sorted_scores[1:3]]
+
+        print_styled(f"\nWinner: {winner}", Fore.GREEN, Style.BRIGHT)
+        print_styled("Congratulations! 🎉", Fore.GREEN, Style.BRIGHT)
+        print_styled(f"Runner-ups: {runner_ups[0]} and {runner_ups[1]}", Fore.YELLOW, Style.BRIGHT)
+
+        # After all agents have processed, we can query the hive mind if needed
+        hive_mind_query = index.query(
+            namespace="hive_mind",
+            vector=await agents[0]._generate_embedding(prompt),  # Use the first agent to generate the query vector
+            top_k=5,
+            include_values=True,
+            include_metadata=True
+        )
         
-        recent_context = " ".join(conversation[-3:])  # Use the last 3 conversation pieces for context
-        discussion_prompt = f"""As {speaking_agent}, engage in the ongoing conversation about '{prompt}'. 
-        Recent context: {recent_context}
-        You can:
-        1. Respond to a point made by {listening_agent} or another agent
-        2. Introduce a new perspective on the original prompt
-        3. Ask a thought-provoking question to the group or a specific agent
-        4. Challenge or support another agent's view
-        Be true to your unique voice and personality. Keep it under 200 words and make it feel like a natural group conversation."""
+        print_styled("\nHive Mind Insights:", Fore.CYAN, Style.BRIGHT)
+        for match in hive_mind_query['matches']:
+            print_styled(f"Agent {match['metadata']['agent']}: {match['metadata']['text']}", Fore.CYAN)
 
-        if speaking_agent == 'Llama Model':
-            response = llama_model(discussion_prompt)
-        else:
-            response = run_agent(speaking_agent, agents[speaking_agent]['model'], discussion_prompt, {}, {})
+        # Log interaction if desired
+        # ... (same as previous code)
+
+        return final_response
+
+    except asyncio.CancelledError:
+        print_styled("\nOperation cancelled. Shutting down gracefully...", Fore.YELLOW, Style.BRIGHT)
+        return "Operation cancelled."
+    except Exception as e:
+        logging.error(f"An error occurred in legion mode: {str(e)}")
+        return f"An error occurred: {str(e)}"
+
+async def handle_feedback(response):
+    print_styled("\nWas this response helpful? (yes/no)", Fore.YELLOW)
+    feedback = await asyncio.get_event_loop().run_in_executor(None, input)
+    feedback = feedback.strip().lower()
+    if feedback == 'no':
+        print_styled("We're sorry the response wasn't helpful. How can we improve it?", Fore.YELLOW)
+        improvement = await asyncio.get_event_loop().run_in_executor(None, input)
+        improvement = improvement.strip()
+        return f"The previous response was not helpful. User suggests: {improvement}"
+    return None
+
+async def save_conversation(conversation_history):
+    with open("conversation_history.txt", "w") as f:
+        for entry in conversation_history:
+            f.write(f"{entry}\n")
+
+async def load_conversation():
+    if os.path.exists("conversation_history.txt"):
+        with open("conversation_history.txt", "r") as f:
+            return f.read().splitlines()
+    return []
+
+async def individual_agent_chat(agent):
+    print_styled(f"Chatting with {agent.name}", agent.color, Style.BRIGHT)
+    while True:
+        user_input = await asyncio.get_event_loop().run_in_executor(None, input, Fore.BLUE + Style.BRIGHT + f"\nYou to {agent.name}: " + Style.RESET_ALL)
+        if user_input.lower() == 'exit':
+            break
+        response = await agent._handle_chat_response(user_input)
+        print_styled(f"{agent.name}: {response}", agent.color)
+
+async def display_options_menu(agents):
+    while True:
+        print_styled("\nOptions Menu:", Fore.YELLOW, Style.BRIGHT)
+        print_styled("1. Activate Legion Mode", Fore.YELLOW)
+        print_styled("2. Chat with Individual Agent", Fore.YELLOW)
+        print_styled("3. Save Conversation", Fore.YELLOW)
+        print_styled("4. Exit", Fore.YELLOW)
         
-        conversation.append(f"{speaking_agent}: {response}")
-        print_styled(f"{speaking_agent} chimes in:", AGENT_COLORS.get(speaking_agent, Fore.WHITE), Style.BRIGHT)
-        print_styled(response, AGENT_COLORS.get(speaking_agent, Fore.WHITE))
-        print_separator('-')
-
-        # Check if the response mentions another agent and have that agent respond
-        mentioned_agents = [agent for agent in list(agents.keys()) + ['Llama Model'] if agent in response]
-        for mentioned_agent in mentioned_agents:
-            if mentioned_agent != speaking_agent:
-                mention_prompt = f"As {mentioned_agent}, respond to the point made by {speaking_agent} in the following context: '{response}'. Keep it under 200 words."
-                if mentioned_agent == 'Llama Model':
-                    mention_response = llama_model(mention_prompt)
-                else:
-                    mention_response = run_agent(mentioned_agent, agents[mentioned_agent]['model'], mention_prompt, {}, {})
-                conversation.append(f"{mentioned_agent}: {mention_response}")
-                print_styled(f"{mentioned_agent} responds:", AGENT_COLORS.get(mentioned_agent, Fore.WHITE), Style.BRIGHT)
-                print_styled(mention_response, AGENT_COLORS.get(mentioned_agent, Fore.WHITE))
-                print_separator('-')
-
-    # Final response generation
-    enhanced_prompt = f"Original prompt: {prompt}\n\nBased on the following conversation, provide your final, comprehensive response to the original prompt:\n{' '.join(conversation)}"
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents)) as executor:
-        future_to_agent = {executor.submit(run_agent, agent_name, agent_info['model'], enhanced_prompt, responses, scores): agent_name for agent_name, agent_info in agents.items()}
-        for future in concurrent.futures.as_completed(future_to_agent):
-            agent_name = future_to_agent[future]
-            response = future.result()
-            responses[agent_name] = response
-            scores[agent_name] = len(response.split())  # Simple scoring for Llama model
-        concurrent.futures.wait(future_to_agent)
-
-    # Add Llama model's final response
-    llama_final_response = llama_model(enhanced_prompt)
-    responses['Llama Model'] = llama_final_response
-    scores['Llama Model'] = len(llama_final_response.split())  # Simple scoring for Llama model
-
-    # Ensure all agents have responses
-    for agent_name in list(agents.keys()) + ['Llama Model']:
-        if agent_name not in responses:
-            responses[agent_name] = f"Error: No response generated for {agent_name}"
-            scores[agent_name] = 0
-
-    # Display individual agent responses and scores
-    for agent_name, response in responses.items():
-        print_separator()
-        print_styled(f"Final response from {agent_name} ({agents.get(agent_name, {}).get('model', 'llama')}):", AGENT_COLORS.get(agent_name, Fore.WHITE), Style.BRIGHT)
-        print_styled(response, AGENT_COLORS.get(agent_name, Fore.WHITE))
-        print_styled(f"Score: {scores[agent_name]:.2f}", AGENT_COLORS.get(agent_name, Fore.WHITE), Style.DIM)
-
-    # Determine the winner
-    winner = max(scores, key=scores.get)
-    winning_currency = agents.get(winner, {}).get('currency', 'Llama Tokens')
-    print_separator('=')
-    print_styled(f"Winner: {winner}", Fore.GREEN, Style.BRIGHT)
-    print_styled(f"Reward: 100 {winning_currency}", Fore.GREEN, Style.BRIGHT)
-    print_separator('=')
-
-    # First referee agent (o1-preview) with Stephen Hawking's personality and intelligence
-    def run_referee_1(prompt):
-        max_retries = 5
-        for attempt in range(max_retries):
+        choice = await asyncio.get_event_loop().run_in_executor(None, input, Fore.BLUE + Style.BRIGHT + "\nEnter your choice (1-4): " + Style.RESET_ALL)
+        
+        if choice == '1':
+            return 'legion'
+        elif choice == '2':
+            print_styled("\nChoose an agent to chat with:", Fore.YELLOW)
+            for i, agent in enumerate(agents, 1):
+                print_styled(f"{i}. {agent.name}", agent.color)
+            agent_choice = await asyncio.get_event_loop().run_in_executor(None, input, Fore.BLUE + Style.BRIGHT + "\nEnter agent number: " + Style.RESET_ALL)
             try:
-                return run_agent("Stephen Hawking (Referee 1)", 'o1-preview', prompt, {}, {})
-            except Exception as e:
-                print_styled(f"Error from Referee 1 (Attempt {attempt+1}/{max_retries}): {str(e)}", Fore.RED, Style.BRIGHT)
-                if attempt == max_retries - 1:
-                    return "The first referee agent encountered an error and could not generate a response."
+                chosen_agent = agents[int(agent_choice) - 1]
+                await individual_agent_chat(chosen_agent)
+            except (ValueError, IndexError):
+                print_styled("Invalid choice. Please try again.", Fore.RED)
+        elif choice == '3':
+            return 'save'
+        elif choice == '4':
+            return 'exit'
+        else:
+            print_styled("Invalid choice. Please try again.", Fore.RED)
 
-    # Second referee agent (gpt-4o) with a personality of Socrates
-    def run_referee_2(prompt):
-        return run_agent("Socrates (Referee 2)", 'gpt-4o', prompt, {}, {})
-
-    # Final blending by the third referee agent (gpt-4o) with a personality of Maxwell Perkins
-    def run_final_referee(prompt):
-        return run_agent("Maxwell Perkins (Final Referee)", 'gpt-4o', prompt, {}, {})
-
-    # First referee agent (o1-preview) combines and analyzes the responses
-    referee_prompt_1 = (
-        "As Stephen Hawking, the first referee agent, analyze the following conversation and final responses from various agents, each with their own personality and writing style. "
-        "Provide a comprehensive summary of the key points and insights, highlighting the most valuable contributions. "
-        "Also, explain why the winning response was chosen and how it compares to the others. "
-        "Finally, synthesize a cohesive response that combines the best elements from all agents. Keep your response under 750 words.\n\n"
-        f"Original Prompt: {prompt}\n\n"
-        f"Conversation:\n{' '.join(conversation)}\n\n"
-        "Final Responses:\n" + "\n".join([f"{agent}: {response[:200]}..." for agent, response in responses.items()]) + "\n\n"
-        f"Winner: {winner} (Score: {scores[winner]:.2f})"
-    )
-
-    referee_1_output = run_referee_1(referee_prompt_1)
-
-    # Second referee agent (gpt-4o) reviews and provides feedback
-    referee_prompt_2 = (
-        "As Socrates, the second referee agent, review the analysis and synthesis provided by the first referee agent. "
-        "Offer constructive feedback, highlight any overlooked points, and suggest improvements or alternative interpretations. "
-        "Then, provide your own synthesis of the key insights and how they address the original prompt. "
-        "Keep your response under 750 words.\n\n"
-        f"Original Prompt: {prompt}\n\n"
-        f"First Referee's Analysis:\n{referee_1_output}\n\n"
-    )
-
-    referee_2_output = run_referee_2(referee_prompt_2)
-
-    # Final blending by the third referee agent (gpt-4o)
-    final_blend_prompt = (
-        "As Maxwell Perkins, the final referee agent, review the feedback and alternative synthesis provided by the second referee agent. "
-        "Integrate the most valuable insights from both analyses to create a final, comprehensive response to the original prompt. "
-        "This final response should represent the best collective wisdom from all agents and both referee perspectives. "
-        "Keep your response under 1000 words.\n\n"
-        f"Original Prompt: {prompt}\n\n"
-        f"First Referee's Analysis:\n{referee_1_output}\n\n"
-        f"Second Referee's Feedback and Synthesis:\n{referee_2_output}\n\n"
-    )
-
-    final_blend_output = run_final_referee(final_blend_prompt)
-
-    # Log the interaction to MongoDB if available
-    if collection is not None:
-        log = {
-            'prompt': prompt,
-            'conversation': conversation,
-            'responses': responses,
-            'scores': scores,
-            'winner': winner,
-            'winning_currency': winning_currency,
-            'referee_1_output': referee_1_output,
-            'referee_2_output': referee_2_output,
-            'final_response': final_blend_output
-        }
-        try:
-            collection.insert_one(log)
-            print_styled("Interaction logged to MongoDB.", Fore.GREEN, Style.DIM)
-        except Exception as e:
-            print_styled(f"Failed to log interaction to MongoDB: {str(e)}", Fore.RED, Style.DIM)
-    else:
-        print_styled("Interaction not logged (MongoDB not available).", Fore.YELLOW, Style.DIM)
-
-    # Colorized final response
-    print_styled("First Referee Agent (Stephen Hawking):", Fore.CYAN, Style.BRIGHT)
-    print_styled(referee_1_output, Fore.CYAN)
-    print_separator('-')
-    print_styled("Second Referee Agent (Socrates):", Fore.MAGENTA, Style.BRIGHT)
-    print_styled(referee_2_output, Fore.MAGENTA)
-    print_separator('-')
-    print_styled("Final Blended Response:", Fore.GREEN, Style.BRIGHT)
-    print_styled(final_blend_output, Fore.GREEN)
-    print_separator('=')
-
-    return final_blend_output
-
-    # Final blending by the third referee agent (gpt-4o) with a personality of Maxwell Perkins
-    def run_final_referee(prompt):
-        return run_agent("Maxwell Perkins (Final Referee)", 'gpt-4o', prompt, {}, {})
-
-    # First referee agent (o1-preview) combines and analyzes the responses
-    referee_prompt_1 = (
-        "As Stephen Hawking, the first referee agent, analyze the following conversation and final responses from various agents, each with their own personality and writing style. "
-        "Provide a comprehensive summary of the key points and insights, highlighting the most valuable contributions. "
-        "Also, explain why the winning response was chosen and how it compares to the others. "
-        "Finally, synthesize a cohesive response that combines the best elements from all agents. Keep your response under 750 words.\n\n"
-        f"Original Prompt: {prompt}\n\n"
-        f"Conversation:\n{' '.join(conversation)}\n\n"
-        "Final Responses:\n" + "\n".join([f"{agent}: {response[:200]}..." for agent, response in responses.items()]) + "\n\n"
-        f"Winner: {winner} (Score: {scores[winner]:.2f})"
-    )
-
-    referee_1_output = run_referee_1(referee_prompt_1)
-
-    # Second referee agent (gpt-4o) reviews and provides feedback
-    referee_prompt_2 = (
-        "As Socrates, the second referee agent, review the analysis and synthesis provided by the first referee agent. "
-        "Offer constructive feedback, highlight any overlooked points, and suggest improvements or alternative interpretations. "
-        "Then, provide your own synthesis of the key insights and how they address the original prompt. "
-        "Keep your response under 750 words.\n\n"
-        f"Original Prompt: {prompt}\n\n"
-        f"First Referee's Analysis:\n{referee_1_output}\n\n"
-    )
-
-    referee_2_output = run_referee_2(referee_prompt_2)
-
-    # Final blending by the third referee agent (gpt-4o)
-    final_blend_prompt = (
-        "As Maxwell Perkins, the final referee agent, review the feedback and alternative synthesis provided by the second referee agent. "
-        "Integrate the most valuable insights from both analyses to create a final, comprehensive response to the original prompt. "
-        "This final response should represent the best collective wisdom from all agents and both referee perspectives. "
-        "Keep your response under 1000 words.\n\n"
-        f"Original Prompt: {prompt}\n\n"
-        f"First Referee's Analysis:\n{referee_1_output}\n\n"
-        f"Second Referee's Feedback and Synthesis:\n{referee_2_output}\n\n"
-    )
-
-    final_blend_output = run_final_referee(final_blend_prompt)
-
-    # Log the interaction to MongoDB if available
-    if collection is not None:
-        log = {
-            'prompt': prompt,
-            'conversation': conversation,
-            'responses': responses,
-            'scores': scores,
-            'winner': winner,
-            'winning_currency': winning_currency,
-            'referee_1_output': referee_1_output,
-            'referee_2_output': referee_2_output,
-            'final_response': final_blend_output
-        }
-        try:
-            collection.insert_one(log)
-            print_styled("Interaction logged to MongoDB.", Fore.GREEN, Style.DIM)
-        except Exception as e:
-            print_styled(f"Failed to log interaction to MongoDB: {str(e)}", Fore.RED, Style.DIM)
-    else:
-        print_styled("Interaction not logged (MongoDB not available).", Fore.YELLOW, Style.DIM)
-
-    # Colorized final response
-    print_styled("First Referee Agent (Stephen Hawking):", Fore.CYAN, Style.BRIGHT)
-    print_styled(referee_1_output, Fore.CYAN)
-    print_separator('-')
-    print_styled("Second Referee Agent (Socrates):", Fore.MAGENTA, Style.BRIGHT)
-    print_styled(referee_2_output, Fore.MAGENTA)
-    print_separator('-')
-    print_styled("Final Blended Response:", Fore.GREEN, Style.BRIGHT)
-    print_styled(final_blend_output, Fore.GREEN)
-    print_separator('=')
-
-    return final_blend_output
-
-# Main execution
-if __name__ == "__main__":
-    print_styled("Welcome to the RADICALIZE-AI Assistant!", Fore.MAGENTA, Style.BRIGHT)
-    print_styled("Type 'exit' to quit the program.", Fore.MAGENTA)
-    print_styled("Type 'activate legion mode' to enable legion mode.", Fore.MAGENTA)
-    print_styled("Type 'deactivate legion mode' to disable legion mode.", Fore.MAGENTA)
-    print_separator('=')
-
-    legion_active = False
+async def main():
+    print_styled("Welcome to RADICALIZE-AI!", Fore.MAGENTA, Style.BRIGHT)
+    
+    agents = [Agent(agent_config, AGENT_COLORS[i % len(AGENT_COLORS)]) for i, agent_config in enumerate(agents_config)]
+    conversation_history = await load_conversation()
 
     while True:
-        prompt = input(Fore.BLUE + Style.BRIGHT + "\nYou: " + Style.RESET_ALL)
-        if prompt.strip().lower() == 'exit':
-            print_styled("Goodbye!", Fore.MAGENTA, Style.BRIGHT)
-            break
-        elif 'activate legion mode' in prompt.lower():
-            legion_active = True
-            print_styled("Legion mode activated.", Fore.GREEN, Style.BRIGHT)
-            continue
-        elif 'deactivate legion mode' in prompt.lower():
-            legion_active = False
-            print_styled("Legion mode deactivated.", Fore.RED, Style.BRIGHT)
-            continue
-
-        try:
-            if legion_active:
-                print_styled("Processing with legion mode...", Fore.YELLOW, Style.DIM)
-                legion_response = legion_mode(prompt)
-                print_styled("Enhancing Llama model response with Legion mode insights...", Fore.GREEN, Style.DIM)
-                enhanced_prompt = f"Original prompt: {prompt}\n\nLegion mode insights: {legion_response}\n\nPlease provide an enhanced response based on the original prompt and the insights from Legion mode."
-                final_response = llama_model(enhanced_prompt)
-                print_styled("Enhanced Assistant Response:", Fore.GREEN, Style.BRIGHT)
-                print_styled(final_response, Fore.GREEN)
-            else:
-                print_styled("Assistant is generating a response...", Fore.GREEN, Style.DIM)
-                response = llama_model(prompt)
-                print_styled("Assistant:", Fore.GREEN, Style.BRIGHT)
-                print_styled(response, Fore.GREEN)
-        except Exception as e:
-            print_styled(f"An error occurred: {str(e)}", Fore.RED, Style.BRIGHT)
-            print_styled("Please check your setup and try again.", Fore.YELLOW)
+        choice = await display_options_menu(agents)
         
-        print_separator('=')
+        if choice == 'legion':
+            print_styled("Legion Mode activated.", Fore.GREEN, Style.BRIGHT)
+            user_input = await asyncio.get_event_loop().run_in_executor(None, input, Fore.BLUE + Style.BRIGHT + "\nLegion Mode Prompt: " + Style.RESET_ALL)
+            final_response = await legion_mode(user_input)
+            print_styled("Final Response:", Fore.GREEN, Style.BRIGHT)
+            print_styled(final_response, Fore.GREEN)
+            conversation_history.append(f"User (Legion Mode): {user_input}")
+            conversation_history.append(f"Legion Response: {final_response}")
+        elif choice == 'save':
+            await save_conversation(conversation_history)
+            print_styled("Conversation saved.", Fore.GREEN, Style.BRIGHT)
+        elif choice == 'exit':
+            await save_conversation(conversation_history)
+            print_styled("Conversation saved. Goodbye!", Fore.MAGENTA, Style.BRIGHT)
+            break
+
+    print_styled("Thank you for using RADICALIZE-AI!", Fore.MAGENTA, Style.BRIGHT)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print_styled("\nProgram terminated by user.", Fore.YELLOW, Style.BRIGHT)
