@@ -5,32 +5,20 @@ import random
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import aiohttp
 
-import threading
 import subprocess
-import time
-import re
 import json
-import networkx as nx
-import matplotlib.pyplot as plt
-from typing import List, Dict, Any
+import numpy as np
+import hashlib
 
-import openai
 from dotenv import load_dotenv
 from colorama import init, Fore, Back, Style
-import requests
 import tiktoken
 import anthropic
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Pinecone
-from langchain_community.graphs import NetworkxEntityGraph
-from langchain_community.llms import OpenAI
-from langchain.text_splitter import CharacterTextSplitter
 from pinecone import Pinecone, ServerlessSpec
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 from openai import OpenAIError
-
-import numpy as np
-import hashlib
 
 # Initialize colorama
 init(autoreset=True)
@@ -53,7 +41,6 @@ if not OPENAI_API_KEY or not CLAUDE_API_KEY or not PINECONE_API_KEY or not PINEC
     exit(1)
 
 # Initialize API clients
-openai.api_key = OPENAI_API_KEY
 claude_client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
 
 # Initialize Pinecone
