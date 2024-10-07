@@ -8,3 +8,5 @@ requests
 accelerate
 python-dotenv
 colorama
+
+#I need to update this
